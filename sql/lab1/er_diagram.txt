@@ -1,0 +1,119 @@
+@startuml
+
+title Система учета личных финансов
+
+entity users {
+    primary_key(id): UUID
+    --
+    email: VARCHAR(255) NOT NULL
+    password_hash: VARCHAR(255) NOT NULL
+    full_name: VARCHAR(100)
+    created_at: TIMESTAMP
+    updated_at: TIMESTAMP
+    --
+    UNIQUE (email)
+}
+
+entity accounts {
+    primary_key(id): UUID
+    foreign_key(user_id): UUID NOT NULL
+    --
+    name: VARCHAR(100) NOT NULL
+    currency: VARCHAR(3) NOT NULL
+    initial_balance: DECIMAL(15,2) DEFAULT 0
+    type: VARCHAR(20) -- checking, savings, cash, credit_card
+    created_at: TIMESTAMP
+    updated_at: TIMESTAMP
+    --
+    UNIQUE (user_id, name)
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+}
+
+entity categories {
+    primary_key(id): UUID
+    foreign_key(user_id): UUID NOT NULL
+    --
+    name: VARCHAR(100) NOT NULL
+    description: TEXT
+    created_at: TIMESTAMP
+    --
+    UNIQUE (user_id, name)
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+}
+
+entity transactions {
+    primary_key(id): UUID
+    foreign_key(account_id): UUID NOT NULL
+    foreign_key(category_id): UUID NOT NULL
+    foreign_key(goal_id): UUID -- nullable
+    foreign_key(import_log_id): UUID -- nullable
+    --
+    amount: DECIMAL(15,2) NOT NULL
+    type: VARCHAR(10) NOT NULL -- income, expense, transfer
+    description: TEXT
+    transaction_date: DATE NOT NULL
+    --
+    CHECK (amount > 0)
+    CHECK (type IN ('income', 'expense', 'transfer'))
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE RESTRICT
+    FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE SET NULL
+    FOREIGN KEY (import_log_id) REFERENCES import_logs(id) ON DELETE SET NULL
+}
+
+entity goals {
+    primary_key(id): UUID
+    foreign_key(account_id): UUID NOT NULL
+    --
+    name: VARCHAR(100) NOT NULL
+    target_amount: DECIMAL(15,2) NOT NULL
+    deadline: DATE
+    status: VARCHAR(20) DEFAULT 'active'
+    created_at: TIMESTAMP
+    updated_at: TIMESTAMP
+    --
+    UNIQUE (account_id, name)
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+    CHECK (target_amount > 0)
+    CHECK (status IN ('active', 'achieved', 'failed'))
+}
+
+entity import_logs {
+    primary_key(id): UUID
+    foreign_key(user_id): UUID NOT NULL
+    --
+    file_name: VARCHAR(255)
+    rows_processed: INTEGER DEFAULT 0
+    rows_succeeded: INTEGER DEFAULT 0
+    error_message: TEXT
+    created_at: TIMESTAMP
+    --
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    CHECK (rows_processed >= rows_succeeded)
+}
+
+entity exchange_rates_usd {
+    primary_key(id): BIGSERIAL
+    --
+    target_currency: VARCHAR(3) NOT NULL
+    rate: DECIMAL(20,10) NOT NULL
+    date: DATE NOT NULL
+    created_at: TIMESTAMP
+    --
+    UNIQUE (target_currency, date)
+    CHECK (rate > 0)
+}
+
+users ||--o{ accounts : ""
+users ||--o{ categories : ""
+users ||--o{ import_logs : ""
+
+accounts ||--o{ transactions : ""
+accounts ||--o{ goals : ""
+
+categories ||--o{ transactions : ""
+goals ||--o{ transactions : ""
+
+import_logs ||--o{ transactions : ""
+
+@enduml
