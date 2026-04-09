@@ -6,3 +6,5 @@
 \i /docker-entrypoint-initdb.d/lab2/join.sql
 \i /docker-entrypoint-initdb.d/lab2/view.sql
 
+\i /docker-entrypoint-initdb.d/lab3/funcs.sql
+
