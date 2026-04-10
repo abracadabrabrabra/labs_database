@@ -210,7 +210,7 @@ SELECT * FROM transactions;
 
 DO $$
 DECLARE
-v_from_account_id UUID;
+    v_from_account_id UUID;
     v_to_account_id UUID;
 BEGIN
 SELECT id INTO v_from_account_id

@@ -7,4 +7,4 @@
 \i /docker-entrypoint-initdb.d/lab2/view.sql
 
 \i /docker-entrypoint-initdb.d/lab3/funcs.sql
-
+\i /docker-entrypoint-initdb.d/lab3/triggers.sql
