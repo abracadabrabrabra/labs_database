@@ -2,3 +2,4 @@
 
 \i /docker-entrypoint-initdb.d/lab5/import_to_goals.sql
 \i /docker-entrypoint-initdb.d/lab5/account_deletion.sql
+\i /docker-entrypoint-initdb.d/lab5/update_status.sql
