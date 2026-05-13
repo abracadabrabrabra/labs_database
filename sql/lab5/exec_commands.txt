@@ -1,0 +1,2 @@
+docker exec -it my_postgres psql -U myuser -d mydatabase
+docker exec -i my_postgres psql -U myuser -d mydatabase < sql\lab5\iso_level\session_num.sql
