@@ -1,0 +1,1163 @@
+==========1(сложный фильтр)=========
+ЗАПРОС БЕЗ ИНДЕКСОВ:
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT * FROM transactions
+WHERE type = 'expense'
+  AND amount BETWEEN 100 AND 2000
+  AND transaction_date >= CURRENT_DATE - 30;
+
+РЕЗУЛЬТАТ:
+
+Gather  (cost=1000.00..40062.98 rows=121829 width=126) (actual time=0.268..176.222 rows=121398 loops=1)
+   Output: id, account_id, category_id, goal_id, import_log_id, amount, type, description, transaction_date, created_at, updated_at
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=11212 read=5241 written=64
+   ->  Parallel Seq Scan on public.transactions  (cost=0.00..26880.08 rows=50762 width=126) (actual time=0.033..159.131 rows=40466 loops=3)
+         Output: id, account_id, category_id, goal_id, import_log_id, amount, type, description, transaction_date, created_at, updated_at
+         Filter: ((transactions.amount >= '100'::numeric) AND (transactions.amount <= '2000'::numeric) AND ((transactions.type)::text = 'expense'::text) AND (transactions.transaction_date >= (CURRENT_DATE - 30)))
+         Rows Removed by Filter: 293201
+         Buffers: shared hit=11212 read=5241 written=64
+         Worker 0:  actual time=0.057..164.892 rows=39772 loops=1
+           Buffers: shared hit=3793 read=1617 written=32
+         Worker 1:  actual time=0.026..165.516 rows=46124 loops=1
+           Buffers: shared hit=4234 read=2032 written=32
+ Planning:
+   Buffers: shared hit=51 read=4
+ Planning Time: 0.177 ms
+ Execution Time: 187.601 ms
+(18 rows)
+
+АНАЛИЗ УЗКИХ МЕСТ ВЫПОЛНЕНИЯ:
+
+PostgreSQL выполняет полное последовательное сканирование всей таблицы (1 000 000+ строк)
+в 3 параллельных потока (Parallel Seq Scan).
+293201 отфильтрованная строка на каждый worker - для каждой строки выполнялась проверка условий `type = 'expense'`,
+`amount BETWEEN 100 AND 2000` и `transaction_date >= CURRENT_DATE - 30`. Только ~121 000 удовлетворяли условиям.
+Execution Time: 187.6 ms** - основное время уходит на фильтрацию всех строк таблицы, несмотря на параллельное выполнение.
+Главное узкое место - полное сканирование таблицы при фильтрации, которая возвращает только 10% строк.
+
+ГИПОТЕЗА:
+
+Создание составного B-tree индекса по полям, участвующим в условиях фильтрации,
+позволит сократить время выполнения запроса за счёт отказа от полного последовательного сканирования таблицы.
+Предполагается, что порядок полей в составном индексе влияет на эффективность выполнения запроса.
+Наиболее эффективным должен оказаться индекс, в котором сначала располагаются поля
+с точным сравнением, а затем поля с диапазонными условиями.
+
+ЗАПРОСЫ С ИНДЕКСАМИ:
+
+BEGIN;
+CREATE INDEX idx_test ON transactions(type, amount, transaction_date);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT * FROM transactions
+WHERE type = 'expense'
+  AND amount BETWEEN 100 AND 2000
+  AND transaction_date >= CURRENT_DATE - 30;
+
+ROLLBACK;
+
+
+BEGIN;
+CREATE INDEX idx_test ON transactions(amount, type, transaction_date);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT * FROM transactions
+WHERE type = 'expense'
+  AND amount BETWEEN 100 AND 2000
+  AND transaction_date >= CURRENT_DATE - 30;
+
+ROLLBACK;
+
+
+BEGIN;
+CREATE INDEX idx_test ON transactions(transaction_date, type, amount);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT * FROM transactions
+WHERE type = 'expense'
+  AND amount BETWEEN 100 AND 2000
+  AND transaction_date >= CURRENT_DATE - 30;
+
+ROLLBACK;
+
+РЕЗУЛЬТАТ:
+
+BEGIN
+CREATE INDEX
+                                                                                                       QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.transactions  (cost=8182.08..27680.80 rows=121829 width=126) (actual time=37.946..131.948 rows=121398 loops=1)
+   Output: id, account_id, category_id, goal_id, import_log_id, amount, type, description, transaction_date, created_at, updated_at
+   Recheck Cond: (((transactions.type)::text = 'expense'::text) AND (transactions.amount >= '100'::numeric) AND (transactions.amount <= '2000'::numeric) AND (transactions.transaction_date >= (CURRENT_DATE - 30)))
+   Heap Blocks: exact=16453
+   Buffers: shared hit=4575 read=13114 written=8252
+   ->  Bitmap Index Scan on idx_test  (cost=0.00..8151.62 rows=121829 width=0) (actual time=35.662..35.663 rows=121398 loops=1)
+         Index Cond: (((transactions.type)::text = 'expense'::text) AND (transactions.amount >= '100'::numeric) AND (transactions.amount <= '2000'::numeric) AND (transactions.transaction_date >= (CURRENT_DATE - 30)))
+         Buffers: shared read=1236 written=936
+ Planning:
+   Buffers: shared hit=11 read=1
+ Planning Time: 0.401 ms
+ Execution Time: 138.405 ms
+(12 rows)
+
+ROLLBACK
+BEGIN
+CREATE INDEX
+                                                                                                       QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.transactions  (cost=16412.40..35911.13 rows=121829 width=126) (actual time=77.496..154.324 rows=121398 loops=1)
+   Output: id, account_id, category_id, goal_id, import_log_id, amount, type, description, transaction_date, created_at, updated_at
+   Recheck Cond: ((transactions.amount >= '100'::numeric) AND (transactions.amount <= '2000'::numeric) AND ((transactions.type)::text = 'expense'::text) AND (transactions.transaction_date >= (CURRENT_DATE - 30)))
+   Heap Blocks: exact=16453
+   Buffers: shared hit=6367 read=12281 written=5797
+   ->  Bitmap Index Scan on idx_test  (cost=0.00..16381.94 rows=121829 width=0) (actual time=75.033..75.033 rows=121398 loops=1)
+         Index Cond: ((transactions.amount >= '100'::numeric) AND (transactions.amount <= '2000'::numeric) AND ((transactions.type)::text = 'expense'::text) AND (transactions.transaction_date >= (CURRENT_DATE - 30)))
+         Buffers: shared read=2195 written=596
+ Planning:
+   Buffers: shared hit=5 read=2
+ Planning Time: 0.196 ms
+ Execution Time: 160.832 ms
+(12 rows)
+
+ROLLBACK
+BEGIN
+CREATE INDEX
+                                                                                                       QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.transactions  (cost=15985.27..35483.99 rows=121829 width=126) (actual time=61.567..165.917 rows=121398 loops=1)
+   Output: id, account_id, category_id, goal_id, import_log_id, amount, type, description, transaction_date, created_at, updated_at
+   Recheck Cond: ((transactions.transaction_date >= (CURRENT_DATE - 30)) AND ((transactions.type)::text = 'expense'::text) AND (transactions.amount >= '100'::numeric) AND (transactions.amount <= '2000'::numeric))
+   Heap Blocks: exact=16453
+   Buffers: shared hit=4710 read=13868 written=2
+   ->  Bitmap Index Scan on idx_test  (cost=0.00..15954.81 rows=121829 width=0) (actual time=59.171..59.172 rows=121398 loops=1)
+         Index Cond: ((transactions.transaction_date >= (CURRENT_DATE - 30)) AND ((transactions.type)::text = 'expense'::text) AND (transactions.amount >= '100'::numeric) AND (transactions.amount <= '2000'::numeric))
+         Buffers: shared read=2125
+ Planning:
+   Buffers: shared hit=5 read=2
+ Planning Time: 0.298 ms
+ Execution Time: 173.375 ms
+(12 rows)
+
+ROLLBACK
+
+ВЫВОД:
+
+В результате эксперимента установлено, что использование составного
+B-tree индекса существенно влияет на производительность запроса.
+Без индекса PostgreSQL использовал Parallel Seq Scan, что приводило к полному просмотру
+таблицы transactions. После создания индекса план выполнения изменился на
+Bitmap Index Scan и Bitmap Heap Scan, что уменьшило время выполнения запроса.
+Наиболее эффективным оказался индекс (type, amount, transaction_date). Это связано с тем,
+что PostgreSQL наиболее эффективно использует составные B-tree индексы, когда сначала идут поля
+с точным сравнением (больше селективность), а затем поля с диапазонными условиями (меньше селективность).
+Индексы, начинающиеся с диапазонных условий, показали худшие результаты,
+поскольку после первого диапазонного условия эффективность использования последующих колонок снижается.
+
+
+==========2(сортировка с order by)=========
+
+ЗАПРОС БЕЗ ИНДЕКСОВ:
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, amount, type, description, transaction_date
+FROM transactions
+WHERE type = 'expense'
+ORDER BY amount DESC
+    LIMIT 10;
+
+РЕЗУЛЬТАТ:
+
+Limit  (cost=27147.24..27148.40 rows=10 width=46) (actual time=170.564..176.303 rows=10 loops=1)
+   Output: id, amount, type, description, transaction_date
+   Buffers: shared hit=11358 read=5167 written=65
+   ->  Gather Merge  (cost=27147.24..75531.35 rows=414692 width=46) (actual time=170.562..176.299 rows=10 loops=1)
+         Output: id, amount, type, description, transaction_date
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=11358 read=5167 written=65
+         ->  Sort  (cost=26147.21..26665.58 rows=207346 width=46) (actual time=167.311..167.312 rows=10 loops=3)
+               Output: id, amount, type, description, transaction_date
+               Sort Key: transactions.amount DESC
+               Sort Method: top-N heapsort  Memory: 26kB
+               Buffers: shared hit=11358 read=5167 written=65
+               Worker 0:  actual time=165.703..165.705 rows=10 loops=1
+                 Sort Method: top-N heapsort  Memory: 26kB
+                 Buffers: shared hit=3263 read=2046 written=32
+               Worker 1:  actual time=166.043..166.045 rows=10 loops=1
+                 Sort Method: top-N heapsort  Memory: 26kB
+                 Buffers: shared hit=3751 read=1593 written=33
+               ->  Parallel Seq Scan on public.transactions  (cost=0.00..21666.54 rows=207346 width=46) (actual time=0.031..101.909 rows=166833 loops=3)
+                     Output: id, amount, type, description, transaction_date
+                     Filter: ((transactions.type)::text = 'expense'::text)
+                     Rows Removed by Filter: 166833
+                     Buffers: shared hit=11287 read=5166 written=64
+                     Worker 0:  actual time=0.049..102.077 rows=160402 loops=1
+                       Buffers: shared hit=3227 read=2046 written=32
+                     Worker 1:  actual time=0.020..101.721 rows=161494 loops=1
+                       Buffers: shared hit=3716 read=1592 written=32
+ Planning:
+   Buffers: shared hit=41 read=3
+ Planning Time: 0.194 ms
+ Execution Time: 176.324 ms
+(32 rows)
+
+АНАЛИЗ УЗКИХ МЕТ ВЫПОЛНЕНИЯ:
+
+Parallel Seq Scan - полное сканирование всей таблицы (1 001 000 строк) для фильтрации по `type = 'expense'`.
+Каждый worker отфильтровывает около 160000 строк, после фильтрации выполняется сортировка
+всех отфильтрованных строк для поиска 10 самых больших сумм. Используется top-N heapsort,
+который требует обработки всех строк для определения топ-10.
+Gather Merge - параллельная сортировка и слияние результатов от 2 workers.
+Основное время уходит на фильтрацию и сортировку большого объёма данных (Execution Time: 176.324 ms).
+
+ГИПОТЕЗА:
+
+Создание индекса, включающего колонки `type` (для фильтрации) и `amount` (для сортировки),
+позволит:
+- использовать Index Scan для фильтрации по `type = 'expense';
+- получить строки уже в отсортированном порядке (без Sort);
+- применить LIMIT без обработки всех строк.
+Предполагается, что индекс `(type, amount DESC)` будет наиболее эффективным,
+так как направление сортировки совпадает с порядком в индексе.
+
+ЗАПРОСЫ С ИНДЕКСАМИ:
+
+BEGIN;
+CREATE INDEX idx_type_amount_desc ON transactions(type, amount DESC);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, amount, type, description, transaction_date
+FROM transactions
+WHERE type = 'expense'
+ORDER BY amount DESC
+    LIMIT 10;
+
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX idx_type_amount ON transactions(type, amount);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, amount, type, description, transaction_date
+FROM transactions
+WHERE type = 'expense'
+ORDER BY amount DESC
+    LIMIT 10;
+
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX idx_amount ON transactions(amount);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, amount, type, description, transaction_date
+FROM transactions
+WHERE type = 'expense'
+ORDER BY amount DESC
+    LIMIT 10;
+
+ROLLBACK;
+
+РЕЗУЛЬТАТЫ:
+
+BEGIN
+CREATE INDEX
+                                                                        QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..1.92 rows=10 width=46) (actual time=0.314..0.322 rows=10 loops=1)
+   Output: id, amount, type, description, transaction_date
+   Buffers: shared read=4
+   ->  Index Scan using idx_type_amount_desc on public.transactions  (cost=0.42..74344.85 rows=497630 width=46) (actual time=0.313..0.318 rows=10 loops=1)
+         Output: id, amount, type, description, transaction_date
+         Index Cond: ((transactions.type)::text = 'expense'::text)
+         Buffers: shared read=4
+ Planning:
+   Buffers: shared hit=5 read=1
+ Planning Time: 0.265 ms
+ Execution Time: 0.339 ms
+(11 rows)
+
+ROLLBACK
+BEGIN
+CREATE INDEX
+                                                                          QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..1.92 rows=10 width=46) (actual time=0.031..0.036 rows=10 loops=1)
+   Output: id, amount, type, description, transaction_date
+   Buffers: shared hit=1 read=3
+   ->  Index Scan Backward using idx_type_amount on public.transactions  (cost=0.42..74344.85 rows=497630 width=46) (actual time=0.031..0.034 rows=10 loops=1)
+         Output: id, amount, type, description, transaction_date
+         Index Cond: ((transactions.type)::text = 'expense'::text)
+         Buffers: shared hit=1 read=3
+ Planning:
+   Buffers: shared hit=6 read=1
+ Planning Time: 0.443 ms
+ Execution Time: 0.049 ms
+(11 rows)
+
+ROLLBACK
+BEGIN
+CREATE INDEX
+                                                                          QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..2.26 rows=10 width=46) (actual time=158.283..158.289 rows=10 loops=1)
+   Output: id, amount, type, description, transaction_date
+   Buffers: shared hit=26823 read=8821 written=7218
+   ->  Index Scan Backward using idx_amount on public.transactions  (cost=0.42..91346.28 rows=497630 width=46) (actual time=158.281..158.285 rows=10 loops=1)
+         Output: id, amount, type, description, transaction_date
+         Filter: ((transactions.type)::text = 'expense'::text)
+         Rows Removed by Filter: 500500
+         Buffers: shared hit=26823 read=8821 written=7218
+ Planning:
+   Buffers: shared hit=6 read=1
+ Planning Time: 0.224 ms
+ Execution Time: 158.303 ms
+(12 rows)
+
+ROLLBACK
+
+ВЫВОД:
+
+В результате эксперимента установлено, что использование индекса для запроса с ORDER BY и LIMIT
+даёт существенно больший выигрыш в производительности по сравнению с запросом со сложным фильтром.
+Это объясняется разным объемом возвращаемых данных (1001000 против 10), разными типами операций (поиск по диапазону
+против точного совпадения и сортировки), особенностями заполнения таблиц (2 типа транзакций, 4 типа amount -
+небольшая селективность для сложного фильтра).
+Наиболее эффективными оказались индексы `(type, amount DESC)` и `(type, amount)`:
+- ускорение в 520-3600 раз по сравнению с полным сканированием;
+- устранение операции сортировки (Sort);
+- использование Index Scan вместо Seq Scan;
+- минимальное количество чтений с диска (4-8 блоков вместо 16 000+).
+Вариант с индексом `(type, amount)` показал даже лучший результат (0.049 ms),
+чем вариант с явным DESC (0.339 ms), что объясняется особенностями оптимизатора PostgreSQL.
+Индекс только по `amount` оказался неэффективным, так как требует дополнительной фильтрации
+по `type` и отбрасывает 500 500 строк, что практически равно времени выполнения без индекса.
+Для запросов с ORDER BY и небольшим LIMIT индекс даёт колоссальный выигрыш,
+так как позволяет прекратить сканирование после нахождения нужного количества строк,
+в отличие от запросов, возвращающих большой процент строк.
+
+
+==========3(альтернативный вариант индексирования)=========
+
+ЗАПРОС БЕЗ ИНДЕКСОВ:
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type, transaction_date
+FROM transactions
+WHERE description ILIKE '%Purchase%'
+  AND transaction_date >= '2025-01-01'
+ORDER BY transaction_date DESC
+LIMIT 100;
+
+РЕЗУЛЬТАТ:
+
+Limit  (cost=30271.22..30282.89 rows=100 width=46) (actual time=533.415..536.170 rows=100 loops=1)
+   Output: id, description, amount, type, transaction_date
+   Buffers: shared hit=2185 read=19329 dirtied=19392 written=19232
+   ->  Gather Merge  (cost=30271.22..39887.09 rows=82416 width=46) (actual time=533.413..536.127 rows=100 loops=1)
+         Output: id, description, amount, type, transaction_date
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=2185 read=19329 dirtied=19392 written=19232
+         ->  Sort  (cost=29271.20..29374.22 rows=41208 width=46) (actual time=529.268..529.276 rows=80 loops=3)
+               Output: id, description, amount, type, transaction_date
+               Sort Key: transactions.transaction_date DESC
+               Sort Method: top-N heapsort  Memory: 39kB
+               Buffers: shared hit=2185 read=19329 dirtied=19392 written=19232
+               Worker 0:  actual time=527.848..527.856 rows=100 loops=1
+                 Sort Method: top-N heapsort  Memory: 39kB
+                 Buffers: shared hit=758 read=6353 dirtied=6368 written=6320
+               Worker 1:  actual time=526.786..526.797 rows=100 loops=1
+                 Sort Method: top-N heapsort  Memory: 40kB
+                 Buffers: shared hit=815 read=6368 dirtied=6400 written=6336
+               ->  Parallel Seq Scan on public.transactions  (cost=0.00..27696.26 rows=41208 width=46) (actual time=0.072..515.748 rows=34192 loops=3)
+                     Output: id, description, amount, type, transaction_date
+                     Filter: ((transactions.description ~~* '%Purchase%'::text) AND (transactions.transaction_date >= '2025-01-01'::date))
+                     Rows Removed by Filter: 299475
+                     Buffers: shared hit=2112 read=19328 dirtied=19392 written=19232
+                     Worker 0:  actual time=0.089..514.456 rows=33945 loops=1
+                       Buffers: shared hit=722 read=6352 dirtied=6368 written=6320
+                     Worker 1:  actual time=0.109..512.836 rows=34253 loops=1
+                       Buffers: shared hit=778 read=6368 dirtied=6400 written=6336
+ Planning:
+   Buffers: shared hit=34 read=2
+ Planning Time: 0.261 ms
+ Execution Time: 536.199 ms
+(32 rows)
+
+АНАЛИЗ УЗКИХ МЕСТ ВЫПОЛНЕНИЯ:
+
+Parallel Seq Scan - полное сканирование всей таблицы (1001000 строк) с фильтрацией по двум условиям:
+текстовый поиск и фильтр по дате.
+Каждый worker отфильтровывает около 299475 строк, оставляя только 34192 строки,
+удовлетворяющих условиям. Sort - после фильтрации выполняется сортировка всех отфильтрованных строк
+для получения 100 самых поздних транзакций.
+Execution Time: 536 ms - основное время уходит на последовательное сканирование
+и фильтрацию каждой строки (включая дорогой поиск по подстроке ILIKE).
+
+ГИПОТЕЗА:
+
+Для оптимизации запроса можно использовать различные типы индексов:
+- B-Tree индекс на `transaction_date` для сортировки и фильтрации по дате
+- GIN индекс для полнотекстового поиска или поиска по подстроке
+Наиболее эффективным должен оказаться комбинированный подход,
+использующий оба индекса через BitmapAnd.
+
+ЗАПРОСЫ С ИНДЕКСАМИ:
+
+BEGIN;
+CREATE INDEX idx_date_btree ON transactions(transaction_date);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type, transaction_date
+FROM transactions
+WHERE description ILIKE '%Purchase%'
+  AND transaction_date >= '2025-01-01'
+ORDER BY transaction_date DESC
+LIMIT 100;
+
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX idx_gin_tsv ON transactions USING gin(description_tsv);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type, transaction_date
+FROM transactions
+WHERE description_tsv @@ to_tsquery('english', 'Purchase')
+  AND transaction_date >= '2025-01-01'
+ORDER BY transaction_date DESC
+LIMIT 100;
+
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX idx_trgm ON transactions USING gin(description gin_trgm_ops);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type, transaction_date
+FROM transactions
+WHERE description ILIKE '%Purchase%'
+  AND transaction_date >= '2025-01-01'
+ORDER BY transaction_date DESC
+LIMIT 100;
+
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX idx_date_btree ON transactions(transaction_date);
+CREATE INDEX idx_trgm ON transactions USING gin(description gin_trgm_ops);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type, transaction_date
+FROM transactions
+WHERE description ILIKE '%Purchase%'
+  AND transaction_date >= '2025-01-01'
+ORDER BY transaction_date DESC
+LIMIT 100;
+
+ROLLBACK;
+
+РЕЗУЛЬТАТЫ:
+
+Без индексов - 536.199 ms - Parallel Seq Scan + Sort
+B-Tree (date) - 1.985 ms - Index Scan Backward + Filter (ILIKE)
+GIN (tsvector) - 173.880 ms - Bitmap Index Scan + Sort
+GIN (trgm) - 242.611 ms - Parallel Bitmap Heap Scan + Sort
+Комбинация (B-Tree+GIN) - 1.568 ms - Index Scan Backward + Filter
+
+                                                                         QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..99.37 rows=100 width=46) (actual time=0.029..1.964 rows=100 loops=1)
+   Output: id, description, amount, type, transaction_date
+   Buffers: shared hit=49 read=472
+   ->  Index Scan Backward using idx_date_btree on public.transactions  (cost=0.42..97854.62 rows=98900 width=46) (actual time=0.029..1.948 rows=100 loops=1)
+         Output: id, description, amount, type, transaction_date
+         Index Cond: (transactions.transaction_date >= '2025-01-01'::date)
+         Filter: (transactions.description ~~* '%Purchase%'::text)
+         Rows Removed by Filter: 419
+         Buffers: shared hit=49 read=472
+ Planning:
+   Buffers: shared hit=5 read=1
+ Planning Time: 0.294 ms
+ Execution Time: 1.985 ms
+(13 rows)
+
+ROLLBACK
+BEGIN
+CREATE INDEX
+                                                                    QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=12004.96..12005.21 rows=100 width=46) (actual time=173.840..173.859 rows=100 loops=1)
+   Output: id, description, amount, type, transaction_date
+   Buffers: shared hit=217 read=21242 written=2294
+   ->  Sort  (cost=12004.96..12011.40 rows=2577 width=46) (actual time=173.839..173.845 rows=100 loops=1)
+         Output: id, description, amount, type, transaction_date
+         Sort Key: transactions.transaction_date DESC
+         Sort Method: top-N heapsort  Memory: 39kB
+         Buffers: shared hit=217 read=21242 written=2294
+         ->  Bitmap Heap Scan on public.transactions  (cost=51.15..11906.47 rows=2577 width=46) (actual time=18.760..151.500 rows=102576 loops=1)
+               Output: id, description, amount, type, transaction_date
+               Recheck Cond: (transactions.description_tsv @@ '''purchas'''::tsquery)
+               Filter: (transactions.transaction_date >= '2025-01-01'::date)
+               Rows Removed by Filter: 97901
+               Heap Blocks: exact=21425
+               Buffers: shared hit=217 read=21242 written=2294
+               ->  Bitmap Index Scan on idx_gin_tsv  (cost=0.00..50.50 rows=5005 width=0) (actual time=15.830..15.831 rows=200477 loops=1)
+                     Index Cond: (transactions.description_tsv @@ '''purchas'''::tsquery)
+                     Buffers: shared hit=34
+ Planning:
+   Buffers: shared hit=13
+ Planning Time: 0.132 ms
+ Execution Time: 173.880 ms
+(22 rows)
+
+ROLLBACK
+BEGIN
+CREATE INDEX
+                                                                            QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=26545.91..26557.58 rows=100 width=46) (actual time=238.117..242.576 rows=100 loops=1)
+   Output: id, description, amount, type, transaction_date
+   Buffers: shared hit=329 read=21425 written=342
+   ->  Gather Merge  (cost=26545.91..36161.78 rows=82416 width=46) (actual time=238.116..242.554 rows=100 loops=1)
+         Output: id, description, amount, type, transaction_date
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=329 read=21425 written=342
+         ->  Sort  (cost=25545.89..25648.91 rows=41208 width=46) (actual time=235.058..235.065 rows=73 loops=3)
+               Output: id, description, amount, type, transaction_date
+               Sort Key: transactions.transaction_date DESC
+               Sort Method: top-N heapsort  Memory: 38kB
+               Buffers: shared hit=329 read=21425 written=342
+               Worker 0:  actual time=233.807..233.814 rows=100 loops=1
+                 Sort Method: top-N heapsort  Memory: 39kB
+                 Buffers: shared hit=8 read=7834 written=151
+               Worker 1:  actual time=233.519..233.527 rows=100 loops=1
+                 Sort Method: top-N heapsort  Memory: 39kB
+                 Buffers: shared hit=8 read=7176 written=92
+               ->  Parallel Bitmap Heap Scan on public.transactions  (cost=1330.25..23970.95 rows=41208 width=46) (actual time=49.284..221.862 rows=34192 loops=3)
+                     Output: id, description, amount, type, transaction_date
+                     Recheck Cond: (transactions.description ~~* '%Purchase%'::text)
+                     Filter: (transactions.transaction_date >= '2025-01-01'::date)
+                     Rows Removed by Filter: 32634
+                     Heap Blocks: exact=6415
+                     Buffers: shared hit=313 read=21425 written=342
+                     Worker 0:  actual time=48.060..221.654 rows=37475 loops=1
+                       Buffers: shared read=7834 written=151
+                     Worker 1:  actual time=47.811..220.460 rows=34345 loops=1
+                       Buffers: shared read=7176 written=92
+                     ->  Bitmap Index Scan on idx_trgm  (cost=0.00..1305.53 rows=192111 width=0) (actual time=47.830..47.830 rows=200477 loops=1)
+                           Index Cond: (transactions.description ~~* '%Purchase%'::text)
+                           Buffers: shared hit=313
+ Planning:
+   Buffers: shared hit=15
+ Planning Time: 0.266 ms
+ Execution Time: 242.611 ms
+(37 rows)
+
+ROLLBACK
+BEGIN
+CREATE INDEX
+2026-05-15 08:55:44.659 UTC [50] LOG:  checkpoint starting: wal
+CREATE INDEX
+                                                                          QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..99.37 rows=100 width=46) (actual time=0.054..1.543 rows=100 loops=1)
+   Output: id, description, amount, type, transaction_date
+   Buffers: shared hit=298 read=223
+   ->  Index Scan Backward using idx_date_btree on public.transactions  (cost=0.42..97854.62 rows=98900 width=46) (actual time=0.053..1.529 rows=100 loops=1)
+         Output: id, description, amount, type, transaction_date
+         Index Cond: (transactions.transaction_date >= '2025-01-01'::date)
+         Filter: (transactions.description ~~* '%Purchase%'::text)
+         Rows Removed by Filter: 419
+         Buffers: shared hit=298 read=223
+ Planning:
+   Buffers: shared hit=7 read=1
+ Planning Time: 0.296 ms
+ Execution Time: 1.568 ms
+(13 rows)
+
+ROLLBACK
+
+ВЫВОД:
+
+В результате эксперимента установлено, что для данного запроса
+наиболее эффективным оказался B-Tree индекс на `transaction_date`,
+а не специализированные GIN индексы для текстового поиска.
+Причины:
+1. B-Tree индекс обеспечивает одновременно фильтрацию по дате (Index Cond),
+сортировку в нужном порядке (Index Scan Backward),
+возможность раннего прекращения сканирования (LIMIT).
+2. GIN индексы (tsvector, trgm) эффективно находят строки по тексту,
+но возвращают слишком много строк, требуя последующей сортировки,
+что сводит на нет выигрыш от текстового поиска.
+3. PostgreSQL выбрал план с B-Tree индексом даже при наличии обоих индексов,
+что подтверждает правильность выбора оптимизатора.
+Итоговое ускорение: 270-340 раз (с 536 ms до 1.6-2.0 ms).
+Выбор типа индекса должен основываться на анализе полного запроса,
+а не только на отдельных условиях. GIN индексы хороши для текстового поиска,
+но если запрос также требует сортировки по другому полю, B-Tree индекс
+может оказаться эффективнее за счёт устранения операции сортировки
+и возможности раннего прекращения сканирования (при LIMIT).
+
+
+==========4(текстовый поиск)=========
+
+Исследованы три вида текстового поиска:
+- подстрока (ILIKE '%Purchase%')
+- префикс (LIKE 'Purchase%')
+- суффикс (LIKE '%Purchase')
+Для каждого вида поиска выполнен анализ производительности без индекса
+и с соответствующим типом индекса (B-Tree для префикса, GIN с pg_trgm для подстроки и суффикса).
+
+
+ЗАПРОС 4.1: ПОИСК ПО ПОДСТРОКЕ (ILIKE '%Purchase%')
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type
+FROM transactions
+WHERE description ILIKE '%Purchase%'
+LIMIT 100;
+
+РЕЗУЛЬТАТ БЕЗ ИНДЕКСА:
+
+Limit  (cost=0.00..14.32 rows=100 width=42) (actual time=0.054..0.553 rows=100 loops=1)
+   Output: id, description, amount, type
+   Buffers: shared read=15 written=15
+   ->  Seq Scan on public.transactions  (cost=0.00..28967.51 rows=202222 width=42) (actual time=0.053..0.542 rows=100 loops=1)
+         Output: id, description, amount, type
+         Filter: (transactions.description ~~* '%Purchase%'::text)
+         Rows Removed by Filter: 367
+         Buffers: shared read=15 written=15
+Planning Time: 0.284 ms
+Execution Time: 0.621 ms
+
+АНАЛИЗ УЗКИХ МЕСТ:
+
+Маленькое время выполнения (0.6 ms) при полном сканировании (Seq Scan).
+В тестовых данных подстрока 'Purchase' встречается в первых же строках
+(формат описания 'Purchase N'). PostgreSQL смог найти 100 строк, просканировав всего 467 строк,
+отфильтровав 367. Вывод: при использовании LIMIT
+сканирование прекращается после нахождения нужного количества строк.
+
+ГИПОТЕЗА:
+
+GIN индекс с pg_trgm должен ускорить поиск по подстроке,
+особенно если искомая подстрока встречается редко.
+
+ЗАПРОС С ИНДЕКСОМ (GIN + pg_trgm):
+
+BEGIN;
+CREATE INDEX idx_trgm_substring ON transactions USING gin(description gin_trgm_ops);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type
+FROM transactions
+WHERE description ILIKE '%Purchase%'
+LIMIT 100;
+
+ROLLBACK;
+
+РЕЗУЛЬТАТ С ИНДЕКСОМ:
+
+Limit  (cost=0.00..14.32 rows=100 width=42) (actual time=0.017..0.489 rows=100 loops=1)
+   Output: id, description, amount, type
+   Buffers: shared hit=8 read=1
+   ->  Seq Scan on public.transactions  (cost=0.00..28967.51 rows=202222 width=42) (actual time=0.016..0.480 rows=100 loops=1)
+         Output: id, description, amount, type
+         Filter: (transactions.description ~~* '%Purchase%'::text)
+         Rows Removed by Filter: 430
+         Buffers: shared hit=8 read=1
+Planning Time: 0.239 ms
+Execution Time: 0.508 ms
+
+Без индекса - 0.621 ms - Seq Scan
+С индексом - 0.508 ms - Seq Scan
+
+ВЫВОД ПО ПОДСТРОКЕ:
+
+В данном конкретном случае индекс не дал особого преимущества, потому что
+искомая подстрока встречается часто с самого начала таблицы, limit
+позволяет сделать раннюю остановку. Для более реалистичной демонстрации
+следовало бы использовать редкую подстроку,
+встречающуюся в конце таблицы, или убрать LIMIT.
+
+
+ЗАПРОС 4.2: ПОИСК ПО ПРЕФИКСУ (LIKE 'Purchase%')
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type
+FROM transactions
+WHERE description LIKE 'Purchase%'
+LIMIT 100;
+
+РЕЗУЛЬТАТ БЕЗ ИНДЕКСА:
+
+Limit  (cost=0.00..14.32 rows=100 width=42) (actual time=0.013..0.157 rows=100 loops=1)
+   Output: id, description, amount, type
+   Buffers: shared hit=10
+   ->  Seq Scan on public.transactions  (cost=0.00..28967.51 rows=202222 width=42) (actual time=0.012..0.142 rows=100 loops=1)
+         Output: id, description, amount, type
+         Filter: (transactions.description ~~ 'Purchase%'::text)
+         Rows Removed by Filter: 430
+         Buffers: shared hit=10
+Planning Time: 0.097 ms
+Execution Time: 0.175 ms
+
+ГИПОТЕЗА:
+
+Для поиска по префиксу B-Tree индекс должен быть эффективен,
+так как строки, начинающиеся с 'Purchase', находятся рядом в отсортированном индексе.
+
+ЗАПРОС С ИНДЕКСОМ (B-Tree для префикса):
+
+BEGIN;
+CREATE INDEX idx_btree_prefix ON transactions(description text_pattern_ops);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type
+FROM transactions
+WHERE description LIKE 'Purchase%'
+LIMIT 100;
+
+ROLLBACK;
+
+РЕЗУЛЬТАТ С ИНДЕКСОМ:
+
+Limit  (cost=0.00..14.32 rows=100 width=42) (actual time=0.010..0.106 rows=100 loops=1)
+   Output: id, description, amount, type
+   Buffers: shared hit=10
+   ->  Seq Scan on public.transactions  (cost=0.00..28967.51 rows=202222 width=42) (actual time=0.009..0.095 rows=100 loops=1)
+         Output: id, description, amount, type
+         Filter: (transactions.description ~~ 'Purchase%'::text)
+         Rows Removed by Filter: 430
+         Buffers: shared hit=10
+Planning Time: 0.248 ms
+Execution Time: 0.119 ms
+
+
+Без индекса - 0.175 ms - Seq Scan
+С индексом - 0.119 ms - Seq Scan
+
+
+ВЫВОД ПО ПРЕФИКСУ:
+
+Аналогично подстроке, префикс 'Purchase' встречается в начале таблицы,
+поэтому даже без индекса сканирование быстро находит нужные строки.
+Планировщик выбрал Seq Scan, так как оцененная стоимость индекса оказалась выше
+из-за накладных расходов. Индекс стал бы полезен при поиске редкого префикса
+или без LIMIT.
+
+
+ЗАПРОС 4.3: ПОИСК ПО СУФФИКСУ (LIKE '%Purchase')
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type
+FROM transactions
+WHERE description LIKE '%Purchase'
+LIMIT 100;
+
+РЕЗУЛЬТАТ БЕЗ ИНДЕКСА:
+
+Limit  (cost=1000.00..22678.55 rows=100 width=42) (actual time=92.826..97.431 rows=0 loops=1)
+   Output: id, description, amount, type
+   Buffers: shared hit=8096 read=8359
+   ->  Gather  (cost=1000.00..22678.55 rows=100 width=42) (actual time=92.824..97.429 rows=0 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=8096 read=8359
+         ->  Parallel Seq Scan on public.transactions  (cost=0.00..21668.55 rows=42 width=42) (actual time=89.120..89.121 rows=0 loops=3)
+               Output: id, description, amount, type
+               Filter: (transactions.description ~~ '%Purchase'::text)
+               Rows Removed by Filter: 333667
+               Buffers: shared hit=8096 read=8359
+Planning Time: 0.114 ms
+Execution Time: 97.464 ms
+
+АНАЛИЗ УЗКИХ МЕСТ:
+
+Parallel Seq Scan - полное сканирование всей таблицы (1 001 000 строк),
+фильтр с суффиксом не может эффективно использовать B-Tree индекс.
+Execution Time: 97.5 ms — полное сканирование даже при LIMIT, так как
+условие не выполняется ни для одной строки (в данных нет суффикса 'Purchase')
+
+ГИПОТЕЗА:
+
+B-Tree индекс не поможет для поиска по суффиксу. GIN индекс с pg_trgm
+должен ускорить поиск, разбивая строки на триграммы.
+
+ЗАПРОС С ИНДЕКСОМ (GIN + pg_trgm):
+
+BEGIN;
+CREATE INDEX idx_trgm_suffix ON transactions USING gin(description gin_trgm_ops);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type
+FROM transactions
+WHERE description LIKE '%Purchase'
+LIMIT 100;
+
+ROLLBACK;
+
+РЕЗУЛЬТАТ С ИНДЕКСОМ:
+
+Limit  (cost=131.43..509.29 rows=100 width=42) (actual time=180.925..180.926 rows=0 loops=1)
+   Output: id, description, amount, type
+   Buffers: shared hit=2266 read=14540 written=9652
+   ->  Bitmap Heap Scan on public.transactions  (cost=131.43..509.29 rows=100 width=42) (actual time=180.923..180.924 rows=0 loops=1)
+         Output: id, description, amount, type
+         Recheck Cond: (transactions.description ~~ '%Purchase'::text)
+         Rows Removed by Index Recheck: 201293
+         Heap Blocks: exact=16455
+         Buffers: shared hit=2266 read=14540 written=9652
+         ->  Bitmap Index Scan on idx_trgm_suffix  (cost=0.00..131.40 rows=100 width=0) (actual time=54.330..54.331 rows=201293 loops=1)
+               Index Cond: (transactions.description ~~ '%Purchase'::text)
+               Buffers: shared hit=351
+Planning Time: 0.181 ms
+Execution Time: 180.947 ms
+
+Без индекса - 97.5 ms - Parallel Seq Scan
+С индексом - 180.9 ms - Bitmap Heap Scan
+
+
+ВЫВОД ПО СУФФИКСУ:
+
+GIN индекс с pg_trgm не улучшил производительность,
+а даже ухудшил её (97 ms против 181 ms). Причины:
+для каждой отфильтрованной строки проводится проверка (Recheck Cond),
+накладные расходы на чтение индекса и случайный доступ к таблице
+превышают затраты на последовательное сканирование.
+
+
+ЗАПРОС 4.4: ПОЛНОТЕКСТОВЫЙ ПОИСК (tsvector)
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount, type,
+       ts_rank(description_tsv, to_tsquery('english', 'Purchase')) as rank
+FROM transactions
+WHERE description_tsv @@ to_tsquery('english', 'Purchase')
+ORDER BY rank DESC
+LIMIT 100;
+
+РЕЗУЛЬТАТ С ИНДЕКСОМ:
+
+Limit  (cost=12098.36..12098.61 rows=100 width=46) (actual time=236.360..236.376 rows=100 loops=1)
+   Output: id, description, amount, type, (ts_rank(description_tsv, '''purchas'''::tsquery))
+   Buffers: shared hit=37 read=21430 written=2226
+   ->  Sort  (cost=12098.36..12110.87 rows=5005 width=46) (actual time=236.357..236.364 rows=100 loops=1)
+         Output: id, description, amount, type, (ts_rank(description_tsv, '''purchas'''::tsquery))
+         Sort Key: (ts_rank(transactions.description_tsv, '''purchas'''::tsquery)) DESC
+         Sort Method: top-N heapsort  Memory: 32kB
+         Buffers: shared hit=37 read=21430 written=2226
+         ->  Bitmap Heap Scan on public.transactions  (cost=51.75..11907.07 rows=5005 width=46) (actual time=36.525..192.951 rows=201293 loops=1)
+               Output: id, description, amount, type, ts_rank(description_tsv, '''purchas'''::tsquery)
+               Recheck Cond: (transactions.description_tsv @@ '''purchas'''::tsquery)
+               Heap Blocks: exact=21430
+               Buffers: shared hit=34 read=21430 written=2226
+               ->  Bitmap Index Scan on idx_gin_tsvector  (cost=0.00..50.50 rows=5005 width=0) (actual time=32.789..32.789 rows=201293 loops=1)
+                     Index Cond: (transactions.description_tsv @@ '''purchas'''::tsquery)
+                     Buffers: shared hit=34
+Planning Time: 0.967 ms
+Execution Time: 236.422 ms
+
+Execution Time: 236 ms - медленнее последовательного сканирования.
+
+Преимущества tsvector (не проявившиеся в этом тесте):
+- Игнорирование стоп-слов (a, an, the, and)
+- Поддержка сложных поисковых запросов (AND, OR, NOT)
+
+ОБЩИЙ ВЫВОД:
+
+В результате эксперимента исследованы различные виды текстового поиска:
+
+1. Поиск по подстроке (ILIKE '%Purchase%'):
+   - При высокой частоте встречаемости и LIMIT индекс не даёт преимущества
+   - GIN с pg_trgm эффективен для редких подстрок
+
+2. Поиск по префиксу (LIKE 'Purchase%'):
+   - B-Tree индекс оптимален, особенно для редких префиксов
+   - При частых префиксах и LIMIT Seq Scan может быть не хуже
+
+3. Поиск по суффиксу (LIKE '%Purchase'):
+   - B-Tree бесполезен
+   - GIN с pg_trgm работает, но при возврате >10% строк может быть медленнее Seq Scan
+   - В эксперименте GIN ухудшил производительность (с 97 ms до 181 ms)
+
+4. Полнотекстовый поиск (tsvector):
+   - Поддерживает морфологию и ранжирование
+   - Требует дополнительной сортировки, что увеличивает время
+   - Эффективен для сложных поисковых запросов, а не простых подстрок
+
+При низкой селективности (возврате большого процента строк) последовательное
+сканирование может быть эффективнее
+из-за меньших накладных расходов на случайный доступ к таблице.
+
+
+==========5(соединение нескольких таблиц JOIN)=========
+
+ЗАПРОС:
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT
+    u.full_name,
+    a.name AS account_name,
+    c.name AS category_name,
+    COUNT(t.id) AS transaction_count,
+    SUM(t.amount) AS total_amount
+FROM transactions t
+JOIN accounts a ON t.account_id = a.id
+JOIN users u ON a.user_id = u.id
+JOIN categories c ON t.category_id = c.id
+WHERE t.type = 'expense'
+  AND t.amount > 100
+  AND t.transaction_date >= '2025-01-01'
+GROUP BY u.full_name, a.name, c.name
+ORDER BY total_amount DESC
+LIMIT 20;
+
+Запрос возвращает топ-20 категорий расходов по счетам пользователей за период с 2025 года.
+Задействованы 4 таблицы:
+- transactions (1 001 000 строк) — фактовая таблица
+- accounts (150 строк) — счета пользователей
+- users (50 строк) — пользователи
+- categories (350 строк) — категории транзакций
+
+РЕЗУЛЬТАТ БЕЗ ИНДЕКСОВ:
+
+Limit  (cost=86534.12..86534.17 rows=20 width=694) (actual time=376.735..376.822 rows=20 loops=1)
+   Output: u.full_name, a.name, c.name, (count(t.id)), (sum(t.amount))
+   Buffers: shared hit=11453 read=5127 written=66, temp read=326 written=326
+   ->  Sort  (cost=86534.12..87013.67 rows=191823 width=694) (actual time=376.734..376.818 rows=20 loops=1)
+         Sort Key: (sum(t.amount)) DESC
+         Sort Method: top-N heapsort  Memory: 27kB
+         ->  Finalize GroupAggregate  (cost=55985.36..81429.78 rows=191823 width=694) (actual time=333.966..376.261 rows=1050 loops=1)
+               Group Key: u.full_name, a.name, c.name
+               ->  Gather Merge  (cost=55985.36..76634.21 rows=159852 width=694) (actual time=333.914..372.892 rows=3150 loops=1)
+                     Workers Planned: 2
+                     Workers Launched: 2
+                     ->  Partial GroupAggregate  (cost=54985.33..57183.30 rows=79926 width=694) (actual time=314.912..347.921 rows=1050 loops=3)
+                           Group Key: u.full_name, a.name, c.name
+                           ->  Sort  (cost=54985.33..55185.15 rows=79926 width=675) (actual time=314.865..322.511 rows=42486 loops=3)
+                                 Sort Key: u.full_name, a.name, c.name
+                                 Sort Method: external merge  Disk: 2608kB
+                                 ->  Hash Join  (cost=41.70..24435.31 rows=79926 width=675) (actual time=0.475..172.762 rows=42486 loops=3)
+                                       Hash Cond: (t.category_id = c.id)
+                                       ->  Hash Join  (cost=26.07..24207.34 rows=79926 width=473) (actual time=0.287..156.207 rows=42486 loops=3)
+                                             Hash Cond: (a.user_id = u.id)
+                                             ->  Hash Join  (cost=14.72..23981.74 rows=79926 width=271) (actual time=0.118..139.148 rows=42486 loops=3)
+                                                   Hash Cond: (t.account_id = a.id)
+                                                   ->  Parallel Seq Scan on public.transactions t  (cost=0.00..23752.97 rows=79926 width=53) (actual time=0.031..117.565 rows=42486 loops=3)
+                                                         Filter: ((t.amount > 100) AND (t.transaction_date >= '2025-01-01') AND ((t.type)::text = 'expense'::text))
+                                                         Rows Removed by Filter: 291181
+                                                   ->  Hash  (cost=12.10..12.10 rows=210 width=250) (actual time=0.074..0.075 rows=150 loops=3)
+                                                         ->  Seq Scan on public.accounts a
+                                             ->  Hash  (cost=10.60..10.60 rows=60 width=234) (actual time=0.037..0.037 rows=50 loops=3)
+                                                   ->  Seq Scan on public.users u
+                                       ->  Hash  (cost=12.50..12.50 rows=250 width=234) (actual time=0.150..0.151 rows=350 loops=3)
+                                             ->  Seq Scan on public.categories c
+Planning Time: 0.532 ms
+Execution Time: 377.284 ms
+
+АНАЛИЗ УЗКИХ МЕСТ ВЫПОЛНЕНИЯ:
+
+Parallel Seq Scan на transactions - основное узкое место:
+отфильтровано 291 181 строк на worker (всего ~873 543 из 1 001 000),
+возвращено 42 486 строк, удовлетворяющих условиям (4.2% таблицы), время сканирования 117 ms.
+Hash Join операции - время незначительно.
+3Sort + GroupAggregate - сортировка и группировка 42 486 строк:
+используется внешняя сортировка на диске (temp read/written 326 блоков), время: 50 ms.
+Основное время (310 ms из 377 ms) уходит на сканирование transactions.
+
+ГИПОТЕЗА:
+
+Создание индексов на внешних ключах (account_id, category_id) и составного индекса
+для фильтрации (type, amount, transaction_date) позволит:
+- использовать Index Scan вместо Seq Scan на transactions;
+- уменьшить количество строк для последующей обработки;
+- избежать создания хеш-таблиц за счёт Nested Loop Join.
+
+ЗАПРОСЫ С ИНДЕКСАМИ:
+
+BEGIN;
+CREATE INDEX idx_transactions_account_id ON transactions(account_id);
+CREATE INDEX idx_transactions_category_id ON transactions(category_id);
+CREATE INDEX idx_transactions_type_amount_date ON transactions(type, amount, transaction_date);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT
+    u.full_name,
+    a.name AS account_name,
+    c.name AS category_name,
+    COUNT(t.id) AS transaction_count,
+    SUM(t.amount) AS total_amount
+FROM transactions t
+         JOIN accounts a ON t.account_id = a.id
+         JOIN users u ON a.user_id = u.id
+         JOIN categories c ON t.category_id = c.id
+WHERE t.type = 'expense'
+  AND t.amount > 100
+  AND t.transaction_date >= '2025-01-01'
+GROUP BY u.full_name, a.name, c.name
+ORDER BY total_amount DESC
+    LIMIT 20;
+
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX idx_transactions_covering ON transactions(type, amount, transaction_date, account_id, category_id);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT
+    u.full_name,
+    a.name AS account_name,
+    c.name AS category_name,
+    COUNT(t.id) AS transaction_count,
+    SUM(t.amount) AS total_amount
+FROM transactions t
+         JOIN accounts a ON t.account_id = a.id
+         JOIN users u ON a.user_id = u.id
+         JOIN categories c ON t.category_id = c.id
+WHERE t.type = 'expense'
+  AND t.amount > 100
+  AND t.transaction_date >= '2025-01-01'
+GROUP BY u.full_name, a.name, c.name
+ORDER BY total_amount DESC
+    LIMIT 20;
+
+ROLLBACK;
+
+Без индекса - 377.3 ms - Parallel Seq Scan
+С индексами (вар.1) - 368.1 ms - Parallel Seq Scan (индексы не использовались)
+С индексами (вар.2) - 398.5 ms - Parallel Seq Scan (индексы не использовались)
+
+--вариант 1 (с индексами)
+Parallel Seq Scan on public.transactions t  (actual time=0.034..118.468 rows=42486 loops=3)
+   Filter: ((t.amount > '100'::numeric) AND (t.transaction_date >= '2025-01-01'::date) AND ((t.type)::text = 'expense'::text))
+   Rows Removed by Filter: 291181
+Execution Time: 368.053 ms
+
+--вариант 2 (покрывающий индекс)
+Parallel Seq Scan on public.transactions t  (actual time=0.023..123.873 rows=42486 loops=3)
+   Filter: ((t.amount > '100'::numeric) AND (t.transaction_date >= '2025-01-01'::date) AND ((t.type)::text = 'expense'::text))
+   Rows Removed by Filter: 291181
+Execution Time: 398.534 ms
+
+ВЫВОД:
+Индексы не были использованы из-за:
+
+1. Низкой селективности фильтра:
+условия `type = 'expense'` (50% строк) + `amount > 100` (>90% expense) + `transaction_date >= '2025-01-01'` (>50% строк);
+последовательное чтение оказалось быстрее.
+
+
+2. Небольших связанных таблиц:
+Hash Join с маленькими таблицами (accounts, users, categories) эффективен,
+Nested Loop с индексами не дал бы выигрыша.
+
+3. Достаточной эффективности Parallel Sec Scan.
+
+
+==========6(негативный сценарий)=========
+
+ЗАПРОС:
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount
+FROM transactions
+WHERE description LIKE '%Purchase'
+LIMIT 100;
+
+РЕЗУЛЬТАТ БЕЗ ИНДЕКСОВ:
+
+Limit  (cost=1000.00..22677.55 rows=100 width=35) (actual time=90.767..95.819 rows=0 loops=1)
+   Output: id, description, amount
+   Buffers: shared hit=11293 read=5161 written=64
+   ->  Gather  (cost=1000.00..22677.55 rows=100 width=35) (actual time=90.766..95.817 rows=0 loops=1)
+         Output: id, description, amount
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=11293 read=5161 written=64
+         ->  Parallel Seq Scan on public.transactions  (cost=0.00..21667.55 rows=42 width=35) (actual time=87.814..87.814 rows=0 loops=3)
+               Output: id, description, amount
+               Filter: (transactions.description ~~ '%Purchase'::text)
+               Rows Removed by Filter: 333667
+               Buffers: shared hit=11293 read=5161 written=64
+               Worker 0:  actual time=86.272..86.272 rows=0 loops=1
+                 Buffers: shared hit=3062 read=2089 written=32
+               Worker 1:  actual time=86.752..86.753 rows=0 loops=1
+                 Buffers: shared hit=4262 read=1511 written=32
+Planning Time: 0.110 ms
+Execution Time: 95.835 ms
+
+АНАЛИЗ УЗКИХ МЕСТ ВЫПОЛНЕНИЯ:
+
+Parallel Seq Scan - полное сканирование всей таблицы (1 001 000 строк) в 3 параллельных потока.
+Filter: (transactions.description ~~ '%Purchase'::text) - условие поиска по суффиксу.
+Это условие не может использовать обычный B-Tree индекс, так как требует проверки окончания строки, а не начала.
+Rows Removed by Filter: 333 667 — все строки были отброшены фильтром,
+так как в тестовых данных нет строк, оканчивающихся на 'Purchase' (нужно 'Purchase N').
+
+ГИПОТЕЗА:
+
+Создание обычного B-Tree индекса на колонке `description` не поможет,
+так как B-Tree индекс эффективен только для поиска по префиксу (LIKE 'Purchase%'),
+но не для поиска по суффиксу (LIKE '%Purchase').
+Для оптимизации такого запроса необходимо использовать специализированный
+GIN индекс с расширением pg_trgm, поддерживающий поиск по подстроке.
+
+ЗАПРОСЫ С ИНДЕКСАМИ:
+
+BEGIN;
+CREATE INDEX idx_description ON transactions(description);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING, VERBOSE)
+SELECT id, description, amount
+FROM transactions
+WHERE description LIKE '%Purchase'
+LIMIT 100;
+
+ROLLBACK;
+
+РЕЗУЛЬТАТЫ:
+
+Без индекса - 95.835 ms - Parallel Seq Scan
+B-Tree (description) - 100.349 ms - Parallel Seq Scan (индекс не используется)
+
+Limit  (cost=1000.00..22677.55 rows=100 width=35) (actual time=96.705..100.330 rows=0 loops=1)
+   Output: id, description, amount
+   Buffers: shared hit=11341 read=5113
+   ->  Gather  (cost=1000.00..22677.55 rows=100 width=35) (actual time=96.703..100.327 rows=0 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=11341 read=5113
+         ->  Parallel Seq Scan on public.transactions  (cost=0.00..21667.55 rows=42 width=35) (actual time=93.340..93.340 rows=0 loops=3)
+               Output: id, description, amount
+               Filter: (transactions.description ~~ '%Purchase'::text)
+               Rows Removed by Filter: 333667
+               Buffers: shared hit=11341 read=5113
+Planning Time: 0.551 ms
+Execution Time: 100.349 ms
+
+ВЫВОД:
+
+В результате эксперимента установлено, что обычный B-Tree индекс
+не используется для поиска по суффиксу (LIKE '%Purchase').
+Причины:
+1. B-Tree индекс хранит строки в отсортированном порядке по первому символу;
+2. Поиск по суффиксу требует проверки окончания строки, что невозможно
+с использованием B-Tree без полного сканирования;
+3. Планировщик PostgreSQL выбирает Seq Scan, так как индекс не может
+эффективно ответить на запрос.
+
+Без индекса: 96 ms (полное сканирование)
+С B-Tree индексом: 100 ms (индекс не используется, небольшое замедление
+из-за накладных расходов на поддержку индекса)
+
+Для разных типов поиска нужны разные типы индексов:
+1. Префиксный поиск - B-Tree;
+2. Суффиксный/подстроковый поиск - GIN с pg_trgm;
+3. Полнотекстовый поиск - GIN с tsvector.
