@@ -1161,3 +1161,48 @@ Execution Time: 100.349 ms
 1. Префиксный поиск - B-Tree;
 2. Суффиксный/подстроковый поиск - GIN с pg_trgm;
 3. Полнотекстовый поиск - GIN с tsvector.
+
+
+=============7(insert & update)==========
+
+INSERT без индексов:
+Insert on test_transactions (actual time=278.755..278.757 rows=0 loops=1)
+   Buffers: shared hit=4083 read=16421
+Execution Time: 278.778 ms
+
+UPDATE без индексов:
+Update on test_transactions (actual time=3365.893..3365.893 rows=0 loops=1)
+   ->  Seq Scan on test_transactions (actual time=0.016..409.154 rows=250000 loops=1)
+         Filter: ((amount > '100'::numeric) AND ((type)::text = 'expense'::text))
+         Rows Removed by Filter: 750000
+Execution Time: 3365.964 ms
+
+Обновлено 250000 строк (25% таблицы), последовательное сканирование - 409 ms,
+суммарное время - 3365.964 ms.
+
+INSERT с индексами:
+Insert on test_transactions (actual time=291.295..291.296 rows=0 loops=1)
+   Buffers: shared hit=15162 read=17695
+Execution Time: 291.317 ms
+
+Небольшое (4.5%, т.к. вставляется только 1001 строка) замедление, из-за необходимости
+перестроения B-дерева.
+
+UPDATE с индексами:
+
+Update on test_transactions (actual time=10328.133..10328.135 rows=0 loops=1)
+   ->  Bitmap Heap Scan on test_transactions (actual time=61.749..413.512 rows=250000 loops=1)
+         Recheck Cond: ((type = 'expense') AND (amount > '100'))
+         ->  BitmapAnd
+               ->  Bitmap Index Scan on idx_test_type_date (rows=500500)
+               ->  Bitmap Index Scan on idx_test_amount (rows=750751)
+Execution Time: 10328.161 ms
+
+Замедление в 3 раза по сравнению с версией без индексов. Около 6.9 секунд ушло на
+обновление индексов (удалить старую запись из idx_test_amount, вставить новую запись в
+idx_test_amount, проверить остальные индексы). Также на это повлияли накладные расходы на
+BitMap операции (cканирование двух индексов, пересечение битовых карт,
+дополнительная проверка (Recheck Cond)). Также сказывается низкая селективность фильтров
+('expense' транзакции - 50% от всех, amount > 100 - 75% от всех).
+
+
